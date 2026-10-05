@@ -9,7 +9,7 @@ bigpdf-app/
 ├── index.html            # shell aplikasi (CSS statis + Font Awesome + 4 script)
 ├── css/
 │   ├── tailwind.css      # sumber Tailwind + komponen kustom (@layer)
-│   └── app.css           # HASIL KOMPILASI — inilah yang dimuat browser
+│   └── app.css           # HASIL KOMPILASI
 ├── js/
 │   ├── config.js         # katalog 27 tool (kategori, opsi, FAQ, cara pakai)
 │   ├── core.js           # util: baca file, render pdf.js, ZIP, toast, dialog
@@ -21,11 +21,11 @@ bigpdf-app/
 │   ├── jszip.min.js        # JSZip — arsip ZIP
 │   └── fontawesome/        # ikon lokal (css + webfonts)
 ├── test/harness.html     # 43 test end-to-end untuk seluruh engine
-├── test/layout.html      # 16 test tata letak (deteksi tumpang tindih & kolom menyempit)
-├── tailwind.config.js    # konfigurasi pemindaian class
+├── test/layout.html      # 16 test tata letak
+├── tailwind.config.js    # konfigurasi class
 ├── check-css.py          # deteksi class yang hilang dari CSS hasil kompilasi
-├── check-dynamic.py      # verifikasi class yang dirakit dinamis
-└── package.json          # hanya devDependency Tailwind CLI
+├── check-dynamic.py      # verifikasi class
+└── package.json          # devDependency Tailwind CLI
 ```
 
 ## Cara menjalankan
