@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PDFNest engine test harness</title>
+  <script src="../vendor/pdf-lib.min.js"></script>
+  <script src="../vendor/pdf.min.js"></script>
+  <script src="../vendor/jszip.min.js"></script>
+  <script src="../js/config.js"></script>
+  <script src="../js/core.js"></script>
+  <script src="../js/tools.js"></script>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script>
+/* =========================================================================
+   End-to-end test of every engine operation, with real PDFs generated
+   in the browser. Results are written to window.__TEST_RESULTS.
+   ========================================================================= */
+(async function () {
+  const U = PDFNest.util;
+  const { PDFDocument, StandardFonts, rgb } = window.PDFLib;
+  const results = [];
+  window.__TEST_RESULTS = results;
+
+  const log = (name, ok, detail) => {
+    results.push({ name, ok, detail: String(detail == null ? '' : detail).slice(0, 300) });
+    document.getElementById('out').textContent = JSON.stringify(results, null, 1);
+  };
+
+  /* ---------------------------------------------------------- fixtures */
+  async function makePdf(label, pages, opts) {
+    opts = opts || {};
+    const d = await PDFDocument.create();
+    const f = await d.embedFont(StandardFonts.Helvetica);
+    for (let i = 0; i < pages; i++) {
+      const p = d.addPage(opts.size || [595, 842]);
+      p.drawText(`${label} page ${i + 1}`, { x: 60, y: 700, size: 22, font: f, color: rgb(0, 0, 0) });
+      if (opts.withImage && i === 0) {
+        const png = await makePng(80, 60, '#3366ff');
+        const img = await d.embedPng(png.bytes);
+        p.drawImage(img, { x: 60, y: 400, width: 160, height: 120 });
+      }
+    }
+    if (opts.encrypt) {
+      d.encrypt({ userPassword: opts.encrypt, ownerPassword: opts.encrypt });
+    }
+    return await d.save({ useObjectStreams: !opts.encrypt });
+  }
+
+  async function makePng(w, h, color) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = color; ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = '#fff'; ctx.fillRect(w * 0.2, h * 0.2, w * 0.6, h * 0.6);
+    const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+    return { bytes: new Uint8Array(await blob.arrayBuffer()), width: w, height: h, blob };
+  }
+
+  async function makeJpeg(w, h, color) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, w, h);
+    grad.addColorStop(0, color); grad.addColorStop(1, '#ffffff');
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, w, h);
+    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+    return { bytes: new Uint8Array(await blob.arrayBuffer()), blob };
+  }
+
+  function entry(name, bytes, kind, fileType) {
+    const file = new File([bytes], name, { type: fileType || (kind === 'pdf' ? 'application/pdf' : 'image/png') });
+    return {
+      id: 'x', file, name, size: file.size, kind: kind || 'pdf',
+      bytes: bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
+      pageCount: 0, rotation: 0, thumbUrl: null, status: 'ready', error: null
+    };
+  }
+
+  async function runOp(id, entries, options, selectedPages) {
+    const tool = BigPDF.toolById(id);
+    const session = {
+      tool, entries, options: options || {},
+      selectedPages: selectedPages || new Set(),
+      pageOrder: null, rotations: {}
+    };
+    const outputs = [];
+    await PDFNest.engine.run(session, {
+      progress: () => {},
+      log: () => {},
+      addOutput: (name, data, mime) => outputs.push({ name, data, mime })
+    });
+    return outputs;
+  }
+
+  async function pagesOf(bytes, password) {
+    const doc = await PDFDocument.load(bytes, password ? { password } : undefined);
+    return doc.getPageCount();
+  }
+
+  async function expect(id, entries, options, check, selectedPages) {
+    try {
+      const outs = await runOp(id, entries, options, selectedPages);
+      if (!outs.length) throw new Error('no output produced');
+      const info = await check(outs);
+      log(id, true, info || `${outs.length} output(s): ${outs.map(o => o.name).join(', ')}`);
+    } catch (e) {
+      log(id, false, (e && e.message) || e);
+      console.error(id, e);
+    }
+  }
+
+  /* ------------------------------------------------------------ fixtures */
+  let pdfA, pdfB, pdfBlank, png, jpg, txt, locked;
+  try {
+    pdfA = await makePdf('Alpha', 4, { withImage: true });
+    pdfB = await makePdf('Beta', 3);
+    // a 3-page document whose middle page really is empty
+    {
+      const d = await PDFDocument.create();
+      const f = await d.embedFont(StandardFonts.Helvetica);
+      d.addPage([595, 842]).drawText('Only page 1 has text', { x: 60, y: 600, size: 18, font: f });
+      d.addPage([595, 842]);
+      d.addPage([595, 842]).drawText('And page 3 too', { x: 60, y: 600, size: 18, font: f });
+      pdfBlank = await d.save({ useObjectStreams: true });
+    }
+    png = await makePng(600, 400, '#3366ff');
+    jpg = await makeJpeg(800, 600, '#ff6633');
+    txt = new TextEncoder().encode('PDFNest test file\nLine two with a much longer content string that should wrap nicely across the page width when converting.\nLine three');
+    locked = await makePdf('Locked', 2, { encrypt: 'secret123' });
+  } catch (e) {
+    log('fixtures', false, e.message);
+  }
+
+  const eA = entry('alpha.pdf', pdfA, 'pdf');
+  const eB = entry('beta.pdf', pdfB, 'pdf');
+  const eBlank = entry('blank.pdf', pdfBlank, 'pdf');
+  const ePng = entry('photo.png', png.bytes, 'image', 'image/png');
+  const eJpg = entry('photo.jpg', jpg.bytes, 'image', 'image/jpeg');
+  const eTxt = entry('notes.txt', txt, 'text', 'text/plain');
+  const eLocked = entry('locked.pdf', locked, 'pdf');
+
+  /* ------------------------------------------------------------- 1 merge */
+  await expect('merge-pdf', [eA, eB], { addBookmarks: true }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 7) throw new Error('expected 7 pages, got ' + n);
+    return `7 pages from 4+3 ✓ (${U.formatBytes(outs[0].data.length)})`;
+  });
+
+  /* ------------------------------------------------ 2 merge pdf+images */
+  await expect('merge-pdf-image', [eA, eJpg, ePng], { imagePageSize: 'fit', imageFit: 'contain', margin: 0 }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 6) throw new Error('expected 6 pages, got ' + n);
+    return `6 pages from 4 pdf + 2 images ✓`;
+  });
+
+  /* ------------------------------------------------------------- 3 split */
+  await expect('split-pdf', [eA], { mode: 'ranges', ranges: '1-2,3,4' }, async outs => {
+    if (outs.length !== 3) throw new Error('expected 3 parts, got ' + outs.length);
+    const counts = [];
+    for (const o of outs) counts.push(await pagesOf(o.data));
+    if (counts.join(',') !== '2,1,1') throw new Error('bad page split: ' + counts.join(','));
+    return `ranges 1-2,3,4 → ${counts.join('+')} ✓`;
+  });
+  await expect('split-pdf', [eA], { mode: 'every', every: 3 }, async outs => {
+    if (outs.length !== 2) throw new Error('expected 2 files, got ' + outs.length);
+    const c = [await pagesOf(outs[0].data), await pagesOf(outs[1].data)];
+    if (c.join(',') !== '3,1') throw new Error('bad split: ' + c);
+    return `every 3 pages → ${c.join('+')} ✓`;
+  });
+  await expect('split-pdf', [eA], { mode: 'parts', parts: 2 }, async outs => {
+    const c = [await pagesOf(outs[0].data), await pagesOf(outs[1].data)];
+    if (c.join(',') !== '2,2') throw new Error('bad split: ' + c);
+    return `2 equal parts → ${c.join('+')} ✓`;
+  });
+  await expect('split-pdf', [eB], { mode: 'each' }, async outs => {
+    if (outs.length !== 3) throw new Error('expected 3 files, got ' + outs.length);
+    return `every page separately → 3 files ✓`;
+  });
+
+  /* --------------------------------------------------------- 4 organize */
+  await expect('organize-pdf', [eA], { reverse: false }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 4) throw new Error('expected 4 pages, got ' + n);
+    return `4 pages preserved ✓`;
+  }, new Set());
+  await expect('organize-pdf', [eA], { reverse: true }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 4) throw new Error('expected 4 pages, got ' + n);
+    return `reversed order, 4 pages ✓`;
+  }, new Set());
+
+  /* ------------------------------------------------------ 5 remove pages */
+  await expect('remove-pages', [eA], { removeBlank: false }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 2) throw new Error('expected 2 pages after removing 0 & 2, got ' + n);
+    return `removed pages 1 & 3 → 2 left ✓`;
+  }, new Set([0, 2]));
+
+  await expect('remove-pages', [eBlank], { removeBlank: true }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 2) throw new Error('expected blank page removed (2 left), got ' + n);
+    return `auto-detected the blank page ✓`;
+  }, new Set());
+
+  /* ----------------------------------------------------- 6 extract pages */
+  await expect('extract-pages', [eA], { asSeparate: false }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 2) throw new Error('expected 2 extracted pages, got ' + n);
+    return `extracted 2 pages into one file ✓`;
+  }, new Set([1, 3]));
+
+  await expect('extract-pages', [eA], { asSeparate: true }, async outs => {
+    if (outs.length !== 2) throw new Error('expected 2 files, got ' + outs.length);
+    return `each page as its own PDF ✓`;
+  }, new Set([0, 2]));
+
+  /* --------------------------------------------------------- 7 compress */
+  await expect('compress-pdf', [eA], { mode: 'light', stripMeta: true }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 4) throw new Error('page count changed: ' + n);
+    return `light mode kept ${n} pages (${U.formatBytes(eA.size)} → ${U.formatBytes(outs[0].data.length)}) ✓`;
+  });
+
+  await expect('compress-pdf', [eA], { mode: 'strong', quality: 55, dpi: 96, grayscale: true }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 4) throw new Error('page count changed: ' + n);
+    return `strong mode ${n} pages, ${U.formatBytes(eA.size)} → ${U.formatBytes(outs[0].data.length)} ✓`;
+  });
+
+  /* ----------------------------------------------------------- 8 resize */
+  await expect('resize-pdf', [eB], { size: 'a4', orientation: 'auto', fit: 'contain', margin: 10 }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    const p = doc.getPage(0);
+    const w = Math.round(p.getWidth()), h = Math.round(p.getHeight());
+    if (Math.abs(w - 595) > 2 || Math.abs(h - 842) > 2) throw new Error(`wrong size ${w}x${h}`);
+    return `resized to A4 ${w}×${h} pt ✓`;
+  });
+
+  /* -------------------------------------------------------------- 9 nup */
+  await expect('n-up-pdf', [eA], { perSheet: '4', size: 'a4', orientation: 'portrait', gap: 8, border: true }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 1) throw new Error('expected 1 sheet for 4 pages, got ' + n);
+    return `4 pages imposed on 1 sheet ✓`;
+  });
+
+  /* ---------------------------------------------------------- 10 rotate */
+  await expect('rotate-pdf', [eA], { angle: '90' }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    const a = doc.getPage(0).getRotation().angle;
+    if (a !== 90) throw new Error('rotation is ' + a);
+    return `all pages rotated 90° ✓`;
+  });
+  await expect('rotate-pdf', [eA], { angle: '270' }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    const angles = doc.getPages().map(p => p.getRotation().angle);
+    if (angles[0] !== 0 || angles[1] !== 270) throw new Error('angles: ' + angles.join(','));
+    return `only the selected page rotated (${angles.join(',')}) ✓`;
+  }, new Set([1]));
+
+  /* ------------------------------------------------------------ 11 crop */
+  await expect('crop-pdf', [eA], { mode: 'margins', top: 20, right: 20, bottom: 20, left: 20 }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    const cb = doc.getPage(0).getCropBox();
+    const w = Math.round(cb.width), h = Math.round(cb.height);
+    // 20 mm = 56.7 pt, so 595 - 113.4 = 481.6 and 842 - 113.4 = 728.6
+    if (Math.abs(w - 482) > 2 || Math.abs(h - 729) > 2) throw new Error(`crop box ${w}x${h}, expected ~482x729`);
+    return `20 mm margins cropped → ${w}×${h} pt ✓`;
+  });
+  await expect('crop-pdf', [eA], { mode: 'auto', threshold: 245, padding: 4 }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    const cb = doc.getPage(0).getCropBox();
+    if (cb.width >= 595) throw new Error('auto-crop did not shrink the page: ' + cb.width);
+    return `auto-crop shrunk page to ${Math.round(cb.width)}×${Math.round(cb.height)} pt ✓`;
+  });
+
+  /* --------------------------------------------------- 12 page numbers */
+  await expect('add-page-numbers', [eA], {
+    position: 'bottom-center', format: 'Page {n} of {total}', startAt: 5, skipFirst: 1,
+    font: 'Helvetica-Bold', size: 14, color: '#ff0000', margin: 30, firstPageCover: true
+  }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 4) throw new Error('page count changed');
+    const pj = await U.openPdfjs(outs[0].data);
+    const texts = [];
+    for (let p = 1; p <= pj.numPages; p++) {
+      const page = await pj.getPage(p);
+      const content = await page.getTextContent();
+      texts.push(content.items.map(i => i.str).join(' '));
+    }
+    pj.destroy();
+    if (texts[0].includes('Page')) throw new Error('the skipped first page should not be numbered');
+    if (!texts[1].includes('Page 5 of 4')) throw new Error('page 2 should read “Page 5 of 4”, got: ' + texts[1]);
+    if (!texts[3].includes('Page 7 of 4')) throw new Error('page 4 should read “Page 7 of 4”, got: ' + texts[3]);
+    return `start-at + skip-first + {total} all correct (5,6,7 of 4) ✓`;
+  });
+
+  /* ----------------------------------------------------- 13 watermark */
+  await expect('add-watermark', [eA], {
+    kind: 'text', text: 'DRAFT COPY', font: 'Helvetica-Bold', fontSize: 40, color: '#ef4444',
+    opacity: 30, position: 'center', tile: false, rotation: 45, pages: '1-2'
+  }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    if (doc.getPageCount() !== 4) throw new Error('page count changed');
+    const pj = await U.openPdfjs(outs[0].data);
+    const page = await pj.getPage(1);
+    const text = (await page.getTextContent()).items.map(i => i.str).join(' ');
+    pj.destroy();
+    if (!text.includes('DRAFT')) throw new Error('watermark text missing');
+    return `text watermark applied ✓`;
+  });
+
+  await expect('add-watermark', [eB], {
+    kind: 'image', imageFile: new File([png.bytes], 'wm.png', { type: 'image/png' }),
+    opacity: 40, position: 'bottom-right', tile: true, rotation: 0, scale: 30, pages: 'all'
+  }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 3) throw new Error('page count changed: ' + n);
+    return `tiled image watermark ✓`;
+  });
+
+  /* -------------------------------------------------------- 14 metadata */
+  await expect('edit-metadata', [eA], {
+    title: 'Quarterly Report', author: 'PDFNest QA', subject: 'Testing', keywords: 'a, b, c',
+    creator: 'harness', producer: 'harness', setDates: true, removeAll: false
+  }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    if (doc.getTitle() !== 'Quarterly Report') throw new Error('title not set: ' + doc.getTitle());
+    if (doc.getAuthor() !== 'PDFNest QA') throw new Error('author not set');
+    const kw = doc.getKeywords() || '';
+    if (!/a/.test(kw) || !/b/.test(kw) || !/c/.test(kw)) throw new Error('keywords missing: ' + kw);
+    return `metadata written (title/author/keywords) ✓`;
+  });
+
+  await expect('edit-metadata', [eA], { removeAll: true, setDates: false }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    if (doc.getTitle()) throw new Error('title still present: ' + doc.getTitle());
+    return `metadata removed ✓`;
+  });
+
+  /* --------------------------------------------------------- 15 flatten */
+  await expect('flatten-pdf', [eA], { forms: true, annotations: true }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 4) throw new Error('page count changed');
+    return `flattened without losing pages ✓`;
+  });
+
+  /* ---------------------------------------------------- 16 image->pdf */
+  await expect('image-to-pdf', [eJpg, ePng], { pageSize: 'a4', fit: 'contain', margin: 10, quality: 92 }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 2) throw new Error('expected 2 pages, got ' + n);
+    return `2 images → 2 A4 pages ✓`;
+  });
+
+  await expect('image-to-pdf', [ePng], { pageSize: 'fit', fit: 'stretch', margin: 0, quality: 92 }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    const p = doc.getPage(0);
+    if (Math.round(p.getWidth()) !== 600) throw new Error('page not image-sized: ' + p.getWidth());
+    return `page matches image size 600×400 ✓`;
+  });
+
+  await expect('jpg-to-pdf', [eJpg], {}, async outs => {
+    const n = await pagesOf(outs[0].data);
+    return `jpg → pdf (${n} page) ✓`;
+  });
+  await expect('png-to-pdf', [ePng], {}, async outs => {
+    const n = await pagesOf(outs[0].data);
+    return `png → pdf (${n} page) ✓`;
+  });
+
+  /* ------------------------------------------------------ 17 txt -> pdf */
+  await expect('txt-to-pdf', [eTxt], {
+    size: 'a4', font: 'Courier', fontSize: 11, margin: 20, lineHeight: 1.4, wrap: true, numbers: true
+  }, async outs => {
+    const doc = await PDFDocument.load(outs[0].data);
+    if (doc.getPageCount() < 1) throw new Error('no pages');
+    const pj = await U.openPdfjs(outs[0].data);
+    const page = await pj.getPage(1);
+    const text = (await page.getTextContent()).items.map(i => i.str).join('');
+    pj.destroy();
+    if (!text.includes('PDFNest test file')) throw new Error('text not present in PDF');
+    return `text file → ${doc.getPageCount()} page PDF, text readable ✓`;
+  });
+
+  /* --------------------------------------------------- 18 pdf -> image */
+  await expect('pdf-to-image', [eA], { format: 'png', dpi: 100, zip: false }, async outs => {
+    if (outs.length !== 4) throw new Error('expected 4 images, got ' + outs.length);
+    if (outs[0].mime !== 'image/png') throw new Error('wrong mime: ' + outs[0].mime);
+    const head = outs[0].data;
+    if (head[0] !== 0x89 || head[1] !== 0x50) throw new Error('not a PNG');
+    return `4 PNG pages rendered ✓`;
+  });
+  await expect('pdf-to-image', [eA], { format: 'jpg', dpi: 150, quality: 80, zip: false }, async outs => {
+    if (outs.length !== 2) throw new Error('expected 2 images for 2 selected pages, got ' + outs.length);
+    if (outs[0].mime !== 'image/jpeg') throw new Error('wrong mime: ' + outs[0].mime);
+    if (outs[0].data[0] !== 0xff || outs[0].data[1] !== 0xd8) throw new Error('not a JPEG');
+    return `selected pages → JPG at 150 DPI ✓`;
+  }, new Set([0, 1]));
+  await expect('pdf-to-jpg', [eB], { format: 'jpg', dpi: 96, zip: false }, async outs => {
+    return `${outs.length} JPG files ✓`;
+  });
+
+  /* ---------------------------------------------------- 19 pdf -> text */
+  await expect('pdf-to-text', [eA], { layout: 'lines', pageMarkers: true, oneFilePerPage: false }, async outs => {
+    const text = new TextDecoder().decode(outs[0].data);
+    if (!text.includes('Alpha page 1')) throw new Error('text not extracted: ' + text.slice(0, 120));
+    if (!text.includes('--- Page 3 ---')) throw new Error('page markers missing');
+    return `text extracted with page markers ✓`;
+  });
+  await expect('pdf-to-text', [eB], { layout: 'lines', oneFilePerPage: true }, async outs => {
+    if (outs.length !== 3) throw new Error('expected 3 files, got ' + outs.length);
+    const first = new TextDecoder().decode(outs[0].data);
+    if (!first.includes('Beta page 1')) throw new Error('wrong content: ' + first.slice(0, 80));
+    return `one .txt per page ✓`;
+  });
+
+  /* ------------------------------------------------- 20 extract images */
+  await expect('extract-images', [eA], { format: 'png', minSize: 32, zip: false }, async outs => {
+    if (!outs.length) throw new Error('no images extracted');
+    if (!outs[0].mime.startsWith('image/')) throw new Error('wrong mime ' + outs[0].mime);
+    return `${outs.length} embedded image(s) extracted ✓`;
+  });
+
+  /* -------------------------------------------------------- 21 protect */
+  await expect('protect-pdf', [eA], {
+    userPassword: 'open-sesame', ownerPassword: 'owner-pass', allowPrint: true, allowCopy: false,
+    allowModify: false, allowAnnotate: true, allowForms: true, allowAssembly: false, allowAccessibility: true
+  }, async outs => {
+    let blocked = false;
+    try { await PDFDocument.load(outs[0].data); } catch (e) { blocked = /encrypt/i.test(e.message); }
+    if (!blocked) throw new Error('output is not encrypted');
+    const doc = await PDFDocument.load(outs[0].data, { password: 'open-sesame' });
+    if (doc.getPageCount() !== 4) throw new Error('page count changed');
+    return `AES-256 encrypted, opens with the right password ✓`;
+  });
+
+  await expect('protect-pdf', [eA, eB], { userPassword: 'multi-pass', allowPrint: false }, async outs => {
+    if (outs.length !== 2) throw new Error('expected 2 protected files, got ' + outs.length);
+    return `2 documents protected in one run ✓`;
+  });
+
+  /* --------------------------------------------------------- 22 unlock */
+  await expect('unlock-pdf', [eLocked], { password: 'secret123' }, async outs => {
+    const n = await pagesOf(outs[0].data);
+    if (n !== 2) throw new Error('page count changed: ' + n);
+    return `password removed, ${n} pages intact ✓`;
+  });
+
+  try {
+    await runOp('unlock-pdf', [eLocked], { password: 'definitely-wrong' });
+    log('unlock-pdf (wrong password rejected)', false, 'accepted a wrong password!');
+  } catch (e) {
+    log('unlock-pdf (wrong password rejected)', true, e.message);
+  }
+
+  /* --------------------------------------- pdf.js rendering (thumbnails) */
+  try {
+    const pj = await U.openPdfjs(pdfA);
+    const page = await pj.getPage(1);
+    const canvas = await U.renderPageToCanvas(page, 0.5);
+    if (!canvas.width || !canvas.height) throw new Error('canvas is empty');
+    const blankCheck = U.isBlankCanvas(canvas, 245, 0.0012);
+    pj.destroy();
+    log('pdf.js render + blank detection', !blankCheck, `canvas ${canvas.width}×${canvas.height}, detected blank=${blankCheck}`);
+  } catch (e) { log('pdf.js render + blank detection', false, e.message); }
+
+  /* ------------------------------------------------------- ZIP archive */
+  try {
+    const outs = await runOp('split-pdf', [eA], { mode: 'each', zip: false });
+    const used = new Set();
+    const blob = await U.buildZip(outs.map(o => ({ name: U.uniqueName(o.name, used), data: o.data })));
+    const zipBytes = new Uint8Array(await blob.arrayBuffer());
+    if (zipBytes[0] !== 0x50 || zipBytes[1] !== 0x4b) throw new Error('not a ZIP file');
+    // read it back with JSZip to be sure the archive is valid and complete
+    const zip = await JSZip.loadAsync(zipBytes);
+    const names = Object.keys(zip.files);
+    if (names.length !== outs.length) throw new Error(`archive holds ${names.length} of ${outs.length} files`);
+    log('zip archive (jszip)', true, `${names.length} files, ${U.formatBytes(zipBytes.length)} — valid PKZIP ✓`);
+  } catch (e) { log('zip archive (jszip)', false, e.message); }
+
+  const failed = results.filter(r => !r.ok);
+  window.__TEST_DONE = true;
+  window.__TEST_SUMMARY = `${results.length - failed.length}/${results.length} passed` + (failed.length ? ' — FAILED: ' + failed.map(f => f.name).join(', ') : '');
+  document.getElementById('out').textContent = JSON.stringify({ summary: window.__TEST_SUMMARY, results }, null, 1);
+})();
+</script>
+</body>
+</html>

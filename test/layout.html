@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PDFNest — layout test</title>
+  <style>
+    body { font-family: ui-monospace, monospace; margin: 0; background: #0f172a; color: #e2e8f0; }
+    #head { padding: 14px 18px; background: #1e293b; position: sticky; top: 0; z-index: 10; }
+    #head b { color: #a5b4fc; }
+    #out { padding: 18px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+    .ok { color: #6ee7b7; }
+    .bad { color: #fca5a5; font-weight: bold; }
+    #frame { width: 1280px; height: 900px; border: 1px solid #334155; display: block; margin: 18px; background: #fff; }
+  </style>
+</head>
+<body>
+  <div id="head"><b>PDFNest layout test</b> — mendeteksi tumpang tindih & kolom menyempit di seluruh halaman.<br>
+    <span id="progress">starting…</span></div>
+  <div id="out"></div>
+  <iframe id="frame" src="../index.html"></iframe>
+
+<script>
+/* =========================================================================
+   Layout regression test.
+
+   Latar belakang: pernah terjadi bug di mana `$('.grid', block)` mengambil
+   <span> ikon (yang juga ber-class `grid place-items-center`) alih-alih
+   container grid-nya. Akibatnya semua kartu tool ter-nest di dalam span 40px,
+   menyempit jadi ~76px dan menimpa heading kategori. Test ini menangkap
+   kelas bug tersebut secara otomatis.
+   ========================================================================= */
+(async () => {
+  const out = document.getElementById('out');
+  const progress = document.getElementById('progress');
+  const results = [];
+  const log = (name, ok, detail) => {
+    results.push({ name, ok, detail });
+    out.innerHTML += `<div class="${ok ? 'ok' : 'bad'}">${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}</div>`;
+  };
+
+  const frame = document.getElementById('frame');
+  const win = frame.contentWindow;
+  const doc = () => frame.contentDocument;
+
+  const ready = () => new Promise((res, rej) => {
+    let n = 0;
+    const t = setInterval(() => {
+      n++;
+      const d = doc();
+      if (d && d.querySelector('#app') && d.querySelector('#app').children.length > 0) { clearInterval(t); res(); }
+      else if (n > 100) { clearInterval(t); rej(new Error('app did not render in time')); }
+    }, 100);
+  });
+
+  const go = async (hash, waitMs = 1400) => {
+    win.location.hash = hash;
+    await new Promise(r => setTimeout(r, waitMs));
+  };
+
+  const scrollTo = (y) => new Promise(r => { win.scrollTo(0, y); setTimeout(r, 350); });
+
+  /* ---------------------------------------------------------------------
+     Detektor tumpang tindih.
+     Elemen teks dianggap "tertimpa" kalau mayoritas titik sampelnya
+     dikuasai elemen lain yang punya background/border.
+     Header & footer sticky dikecualikan — menutupi konten saat scroll itu wajar.
+     --------------------------------------------------------------------- */
+  const DETECT = `(() => {
+    const inSticky = el => {
+      let n = el;
+      while (n && n !== document.body) {
+        const cs = getComputedStyle(n);
+        if (cs.position === 'fixed' || cs.position === 'sticky') return true;
+        n = n.parentElement;
+      }
+      return false;
+    };
+    // elemen di dalam <details> tertutup punya rect tapi tidak terlihat —
+    // elementFromPoint akan mengembalikan <details>-nya, jadi harus diskip
+    const hidden = el => {
+      let n = el;
+      while (n && n !== document.body) {
+        if (n.tagName === 'DETAILS' && !n.open) {
+          // hanya anak setelah <summary> yang benar-benar tersembunyi
+          const kids = [...n.children].filter(c => c.tagName !== 'SUMMARY');
+          if (kids.some(k => k.contains(el))) return true;
+        }
+        n = n.parentElement;
+      }
+      return false;
+    };
+    const overlaps = [];
+    const narrow = [];
+
+    const els = [...document.querySelectorAll('body *')].filter(el => {
+      if (inSticky(el) || hidden(el)) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 4 || r.height < 4) return false;
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+      return [...el.childNodes].some(n => n.nodeType === 3 && n.textContent.trim().length > 2);
+    });
+
+    for (const el of els) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom < 0 || r.top > innerHeight) continue;
+      const pts = [
+        [r.left + 4, r.top + r.height / 2],
+        [r.left + r.width / 2, r.top + r.height / 2],
+        [r.right - 4, r.top + r.height / 2],
+        [r.left + r.width / 2, r.top + 3],
+        [r.left + r.width / 2, r.bottom - 3]
+      ];
+      let blocked = 0;
+      for (const [x, y] of pts) {
+        if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) continue;
+        const top = document.elementFromPoint(x, y);
+        if (!top || top === el || el.contains(top) || top.contains(el)) continue;
+        if (inSticky(top) || hidden(top)) continue;
+        const cs = getComputedStyle(top);
+        const bg = cs.backgroundColor;
+        if ((bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent')
+            || cs.borderTopWidth !== '0px'
+            || top.tagName === 'A' || top.tagName === 'BUTTON') blocked++;
+      }
+      if (blocked >= 2) overlaps.push({ text: el.textContent.trim().slice(0, 45), tag: el.tagName });
+    }
+
+    // gejala bug nesting: kartu tool yang menyempit jadi kolom kecil
+    for (const card of document.querySelectorAll('.card-hover')) {
+      const w = card.getBoundingClientRect().width;
+      if (w > 10 && w < 180) {
+        const t = card.querySelector('h3');
+        narrow.push({ text: (t ? t.textContent : card.textContent).trim().slice(0, 35), w: Math.round(w) });
+      }
+    }
+    return JSON.stringify({ overlaps, narrow });
+  })()`;
+
+  /* ---------------------------------------------------------------------
+     1. Setiap kartu tool harus berada langsung di dalam container grid,
+        bukan di dalam <span> ikon.
+     --------------------------------------------------------------------- */
+  try {
+    await ready();
+    await go('#/');
+    const info = JSON.parse(win.eval(`(() => {
+      const grid = document.querySelector('#homeCategories .cat-tool-grid');
+      if (!grid) return JSON.stringify({ err: 'no .cat-tool-grid' });
+      const cards = [...grid.children];
+      return JSON.stringify({
+        cards: cards.length,
+        gridW: Math.round(grid.getBoundingClientRect().width),
+        cardW: cards[0] ? Math.round(cards[0].getBoundingClientRect().width) : 0,
+        nested: cards.filter(c => c.closest('span[class*="place-items-center"]')).length,
+        parentTag: cards[0] ? cards[0].parentElement.className.slice(0, 30) : null
+      });
+    })()`));
+    const ok = info.cards > 0 && !info.nested && info.cardW >= 180;
+    log('home: kartu tool di container grid (bukan di dalam span ikon)', ok,
+      `${info.cards} kartu, lebar ${info.cardW}px, nested=${info.nested}`);
+  } catch (e) { log('home: kartu tool di container grid', false, e.message); }
+
+  /* ---------------------------------------------------------------------
+     2. Modal saran tool memakai grid yang benar.
+        Modal hanya muncul setelah file di-drop, jadi harus dipicu dulu.
+     --------------------------------------------------------------------- */
+  try {
+    await go('#/', 1500);
+    const info = JSON.parse(await win.eval(`(async () => {
+      // buat file PDF kecil lalu drop ke hero dropzone
+      await window.PDFNest.deps.pdfLib();
+      const d = await window.PDFLib.PDFDocument.create();
+      d.addPage([595, 842]);
+      const f = new File([await d.save()], 't.pdf', { type: 'application/pdf' });
+      const dt = new DataTransfer(); dt.items.add(f);
+      document.querySelector('#heroDrop').dispatchEvent(
+        new DragEvent('drop', { bubbles: true, dataTransfer: dt }));
+      await new Promise(r => setTimeout(r, 1500));
+      const grid = document.querySelector('.suggest-grid');
+      if (!grid) return JSON.stringify({ err: 'modal did not open' });
+      const cards = [...grid.children];
+      return JSON.stringify({
+        cards: cards.length,
+        cardW: cards[0] ? Math.round(cards[0].getBoundingClientRect().width) : 0,
+        nested: cards.filter(c => c.closest('span[class*="place-items-center"]')).length
+      });
+    })()`));
+    if (info.err) throw new Error(info.err);
+    log('suggest modal: grid terpisah dari span ikon', !info.nested && info.cardW >= 150,
+      `${info.cards} kartu @ ${info.cardW}px`);
+    // tutup modal supaya tidak mengganggu test berikutnya
+    win.eval(`document.querySelector('[data-close]')?.click()`);
+    await new Promise(r => setTimeout(r, 500));
+  } catch (e) { log('suggest modal: grid terpisah dari span ikon', false, e.message); }
+
+  /* ---------------------------------------------------------------------
+     3. Tidak ada tumpang tindih di setiap halaman, di banyak posisi scroll.
+     --------------------------------------------------------------------- */
+  const routes = ['#/', '#/tools', '#/category/organize', '#/category/security',
+                  '#/tool/merge-pdf', '#/tool/compress-pdf', '#/about', '#/help'];
+  for (const route of routes) {
+    try {
+      await go(route, 1600);
+      let overlaps = [], narrow = [];
+      for (const y of [0, 700, 1400, 2100, 2800]) {
+        await scrollTo(y);
+        const r = JSON.parse(win.eval(DETECT));
+        overlaps = overlaps.concat(r.overlaps);
+        narrow = narrow.concat(r.narrow);
+      }
+      const ok = overlaps.length === 0 && narrow.length === 0;
+      log(`layout ${route}: tanpa tumpang tindih & kolom menyempit`, ok,
+        ok ? 'bersih' : `${overlaps.length} overlap, ${narrow.length} sempit` +
+          (overlaps[0] ? ` (mis. "${overlaps[0].text}")` : '') +
+          (narrow[0] ? ` (mis. "${narrow[0].text}" @ ${narrow[0].w}px)` : ''));
+    } catch (e) { log(`layout ${route}`, false, e.message); }
+  }
+
+  /* ---------------------------------------------------------------------
+     4. Setiap halaman punya header + footer + konten (shell terpasang).
+     --------------------------------------------------------------------- */
+  for (const route of ['#/', '#/tools', '#/category/edit', '#/tool/protect-pdf', '#/about', '#/help']) {
+    try {
+      await go(route, 1300);
+      const ok = win.eval(`!!document.querySelector('header') && !!document.querySelector('footer') && document.querySelector('#app').children.length >= 3`);
+      log(`shell ${route}: header + footer + konten`, ok);
+    } catch (e) { log(`shell ${route}`, false, e.message); }
+  }
+
+  /* --------------------------------------------------------------------- */
+  const failed = results.filter(r => !r.ok);
+  window.__LAYOUT_DONE = true;
+  window.__LAYOUT_SUMMARY = `${results.length - failed.length}/${results.length} passed` +
+    (failed.length ? ' — FAILED: ' + failed.map(f => f.name).join(' | ') : '');
+  progress.innerHTML = `<b class="${failed.length ? 'bad' : 'ok'}">${window.__LAYOUT_SUMMARY}</b>`;
+  out.innerHTML += `\n<div class="${failed.length ? 'bad' : 'ok'}">${window.__LAYOUT_SUMMARY}</div>`;
+})();
+</script>
+</body>
+</html>
